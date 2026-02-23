@@ -19,13 +19,28 @@ function createWindow() {
   mainWindow.loadURL("http://localhost:3000");
 }
 
-ipcMain.handle("execute-request", async (event, payload) => {
-  console.log("Received from renderer:", payload);
+ipcMain.handle('execute-request', async (event, payload) => {
+    console.log('Execute request via Electron:', payload);
 
-  return {
-    message: "IPC working",
-    payload
-  };
+    return {
+        status: 200,
+        body: "Electron execution working"
+    };
+});
+
+ipcMain.handle('ws-connect', async (event, payload) => {
+    console.log('WS connect:', payload);
+    return { success: true };
+});
+
+ipcMain.handle('ws-send', async (event, payload) => {
+    console.log('WS send:', payload);
+    return { success: true };
+});
+
+ipcMain.handle('ws-disconnect', async (event, payload) => {
+    console.log('WS disconnect:', payload);
+    return { success: true };
 });
 
 app.whenReady().then(createWindow);
