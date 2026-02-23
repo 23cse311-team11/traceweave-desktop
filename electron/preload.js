@@ -1,5 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+console.log("✅ PRELOAD LOADED");
+
 contextBridge.exposeInMainWorld('electronAPI', {
     executeRequest: (payload) =>
         ipcRenderer.invoke('execute-request', payload),
