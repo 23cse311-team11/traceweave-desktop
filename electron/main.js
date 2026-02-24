@@ -1,8 +1,9 @@
 import { app, BrowserWindow, ipcMain } from "electron";
+import { fileURLToPath } from "url";
+import path from "path";
 import http from "http";
 import https from "https";
-import path from "path";
-import { fileURLToPath } from "url";
+import WebSocket from "ws";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,7 +57,7 @@ ipcMain.handle("execute-request", async (event, data) => {
   try {
     const config =
       data?.payload?.overrides?.config ||
-      data?.payload?.config;
+      data?.payload?.config; 
 
     const envVars = data?.payload?.environmentValues || {};
 
@@ -168,20 +169,110 @@ ipcMain.handle("execute-request", async (event, data) => {
 
 
 // =====================================================
-// WEBSOCKET PLACEHOLDERS
+// WEBSOCKET EXECUTION LOGIC
 // =====================================================
 
-ipcMain.handle("ws-connect", async (_, payload) => {
-  console.log("WS connect:", payload);
-  return { success: true };
+const activeWebSockets = new Map();
+
+ipcMain.handle("ws-connect", async (event, payload) => {
+  console.log("WS Connect Request:", payload);
+  try {
+    const { connectionId, url, headers = {}, params = {}, environmentValues = {} } = payload;
+
+    // 1. Clean up existing connection if it exists
+    if (activeWebSockets.has(connectionId)) {
+      activeWebSockets.get(connectionId).close();
+      activeWebSockets.delete(connectionId);
+    }
+
+    // 2. URL and Param Injection
+    const resolvedUrl = injectVariables(url, environmentValues);
+    const parsedUrl = new URL(resolvedUrl);
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+      const injectedValue = injectVariables(value, environmentValues);
+      if (injectedValue !== undefined && injectedValue !== null) {
+        parsedUrl.searchParams.set(key, injectedValue);
+      }
+    });
+
+    // 3. Header Injection
+    const injectedHeaders = {};
+    Object.entries(headers || {}).forEach(([key, value]) => {
+      injectedHeaders[key] = injectVariables(value, environmentValues);
+    });
+
+    // 4. Initialize Connection
+    const ws = new WebSocket(parsedUrl.toString(), {
+      headers: injectedHeaders,
+    });
+
+    activeWebSockets.set(connectionId, ws);
+
+    // 5. Wire up Event Listeners to push data to the Renderer
+    ws.on("open", () => {
+      event.sender.send("ws-event", { connectionId, type: "open" });
+    });
+
+    ws.on("message", (data) => {
+      // Data is a Buffer, convert to string for the frontend
+      event.sender.send("ws-event", {
+        connectionId,
+        type: "message",
+        data: data.toString(),
+        timestamp: Date.now()
+      });
+    });
+
+    ws.on("error", (err) => {
+      console.error(`WS Error [${connectionId}]:`, err.message);
+      event.sender.send("ws-event", {
+        connectionId,
+        type: "error",
+        error: err.message,
+      });
+    });
+
+    ws.on("close", (code, reason) => {
+      event.sender.send("ws-event", {
+        connectionId,
+        type: "close",
+        code,
+        reason: reason.toString(),
+      });
+      activeWebSockets.delete(connectionId);
+    });
+
+    return { success: true };
+  } catch (err) {
+    console.error("WS CONNECTION FAILED:", err);
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle("ws-send", async (_, payload) => {
-  console.log("WS send:", payload);
-  return { success: true };
+  const { connectionId, message } = payload;
+  const ws = activeWebSockets.get(connectionId);
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return { success: false, error: "WebSocket is not connected" };
+  }
+
+  try {
+    ws.send(message);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle("ws-disconnect", async (_, payload) => {
-  console.log("WS disconnect:", payload);
+  const { connectionId } = payload;
+  const ws = activeWebSockets.get(connectionId);
+
+  if (ws) {
+    ws.close();
+    activeWebSockets.delete(connectionId);
+  }
   return { success: true };
 });
