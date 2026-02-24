@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import { fileURLToPath } from "url";
+import { CookieJar } from "tough-cookie";
 import path from "path";
 import http from "http";
 import https from "https";
@@ -24,7 +25,80 @@ function createWindow() {
   mainWindow.loadURL("http://localhost:3000");
 }
 
-app.whenReady().then(createWindow);
+const cookieJarPath = path.join(app.getPath("userData"), "cookie-jar.json");
+let cookieJar;
+
+function initCookieJar() {
+  if (fs.existsSync(cookieJarPath)) {
+    try {
+      const data = fs.readFileSync(cookieJarPath, "utf-8");
+      cookieJar = CookieJar.fromJSON(data);
+    } catch (err) {
+      console.error("Failed to load cookie jar:", err);
+      cookieJar = new CookieJar();
+    }
+  } else {
+    cookieJar = new CookieJar();
+  }
+}
+
+function saveCookieJar() {
+  try {
+    fs.writeFileSync(cookieJarPath, JSON.stringify(cookieJar.toJSON()), "utf-8");
+  } catch (err) {
+    console.error("Failed to save cookie jar:", err);
+  }
+}
+
+// Initialize on startup
+app.whenReady().then(() => {
+  initCookieJar();
+  createWindow();
+});
+
+// --- Cookie IPC Handlers ---
+
+ipcMain.handle("get-jar-cookies", async (_, { domain }) => {
+  const serialized = cookieJar.toJSON();
+  // ✨ FIX: tough-cookie v4 uses an array for serialized.cookies
+  let cookies = Array.isArray(serialized.cookies) ? serialized.cookies : [];
+  
+  if (domain) {
+    cookies = cookies.filter(c => c.domain.includes(domain));
+  }
+  return cookies;
+});
+
+ipcMain.handle("create-jar-cookie", async (_, { url, cookieString }) => {
+  try {
+    await cookieJar.setCookie(cookieString, url);
+    saveCookieJar();
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle("delete-jar-cookie", async (_, { domain, key }) => {
+    const serialized = cookieJar.toJSON();
+    serialized.cookies = (serialized.cookies || []).filter(c => !(c.domain === domain && c.key === key));
+    
+    cookieJar = CookieJar.fromJSON(serialized);
+    saveCookieJar();
+    return { success: true };
+});
+
+ipcMain.handle("clear-jar-cookies", async (_, { domain }) => {
+  if (domain) {
+    const serialized = cookieJar.toJSON();
+    serialized.cookies = (serialized.cookies || []).filter(c => c.domain !== domain);
+    cookieJar = CookieJar.fromJSON(serialized);
+  } else {
+    cookieJar.removeAllCookiesSync();
+  }
+  saveCookieJar();
+  return { success: true };
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
@@ -49,8 +123,6 @@ function injectVariables(value, variables = {}) {
 // HTTP REQUEST HANDLER
 // =====================================================
 ipcMain.handle("execute-request", async (event, data) => {
-  // console.log("\n--- [DEBUG] IPC REQUEST RECEIVED ---");
-  
   try {
     const config = data?.overrides?.config || data?.config || data?.payload?.config;
     const envVars = data?.environmentValues || {};
@@ -58,9 +130,6 @@ ipcMain.handle("execute-request", async (event, data) => {
     if (!config) throw new Error("No config found in IPC payload");
     
     const { method, url, headers = {}, body } = config;
-    // console.log(`[Debug] Method: ${method}, Target URL: ${url}`);
-    // console.log(`[Debug] Incoming Body Payload: ${body ? JSON.stringify(body, null, 2) : "No body"}`);
-    
     const resolvedUrl = new URL(injectVariables(url, envVars));
 
     const injectedHeaders = {};
@@ -68,48 +137,36 @@ ipcMain.handle("execute-request", async (event, data) => {
       injectedHeaders[k] = injectVariables(v, envVars);
     });
 
+    const existingCookies = injectedHeaders['Cookie'] || '';
+    const jarCookies = await cookieJar.getCookieString(resolvedUrl.toString());
+    
+    if (jarCookies) {
+      injectedHeaders['Cookie'] = existingCookies ? `${existingCookies}; ${jarCookies}` : jarCookies;
+    }
+
     let form = null;
     let binaryStream = null;
 
-    // --- FORM DATA DEBUGGING ---
     if (body?.type === "formdata") {
-      // console.log("[Debug] Executing Form-Data request stream buildup...");
       form = new FormData();
-      
       body.formdata.forEach((item) => {
         if (item.isFile) {
-          // console.log(`[Debug] Attempting to attach file: Key="${item.key}", Path="${item.path}"`);
-          
           if (item.path && fs.existsSync(item.path)) {
-            const stats = fs.statSync(item.path);
-            // console.log(`[Debug] Success: File found. Size: ${stats.size} bytes`);
             form.append(item.key, fs.createReadStream(item.path));
-          } else {
-            // console.error(`[Debug] Error: File path is invalid or missing: ${item.path}`);
           }
         } else {
           form.append(item.key, injectVariables(item.value, envVars));
         }
       });
 
-      // CRITICAL: If the user set a Content-Type manually, it breaks the boundary.
       const ctKey = Object.keys(injectedHeaders).find(k => k.toLowerCase() === 'content-type');
-      if (ctKey) {
-        // console.log(`[Debug] Removing manual Content-Type: ${injectedHeaders[ctKey]} to allow boundary generation.`);
-        delete injectedHeaders[ctKey];
-      }
+      if (ctKey) delete injectedHeaders[ctKey];
 
-      const formHeaders = form.getHeaders();
-      Object.assign(injectedHeaders, formHeaders);
-      // console.log("[Debug] Final Form Headers:", formHeaders);
+      Object.assign(injectedHeaders, form.getHeaders());
     } 
-    
     else if (body?.type === "binary" && body?.binaryFile?.path) {
-        // console.log(`[Debug] Detected Binary Stream: ${body.binaryFile.path}`);
         if (fs.existsSync(body.binaryFile.path)) {
             binaryStream = fs.createReadStream(body.binaryFile.path);
-        } else {
-            // console.error(`[Debug] Error: Binary file path is invalid: ${body.binaryFile.path}`);
         }
     }
 
@@ -118,30 +175,69 @@ ipcMain.handle("execute-request", async (event, data) => {
 
     return await new Promise((resolve) => {
       const req = lib.request(resolvedUrl, { method, headers: injectedHeaders }, (res) => {
+        
+        // ✨ 5. EXTRACT SET-COOKIE HEADERS AND SECURELY SAVE TO JAR
+        const setCookieHeaders = res.headers['set-cookie'];
+        if (setCookieHeaders) {
+          setCookieHeaders.forEach(cookieStr => {
+            try {
+              cookieJar.setCookieSync(cookieStr, resolvedUrl.toString());
+            } catch (err) {
+              console.warn(`[Tough-Cookie] Rejected cookie from server: ${cookieStr}`, err.message);
+            }
+          });
+          saveCookieJar();
+        }
+
         const chunks = [];
         res.on("data", (chunk) => chunks.push(chunk));
         res.on("end", () => {
           const rawBody = Buffer.concat(chunks).toString();
+          
+          // ✨ FIX 1: Parse the body as JSON if possible
+          let parsedData = rawBody;
+          try {
+            parsedData = JSON.parse(rawBody);
+          } catch {
+            // If it fails, keep it as a raw string (e.g. for HTML/text responses)
+          }
+
+          // ✨ FIX 2: Manually construct a `cookies` object for the frontend
+          const cookiesObj = {};
+          const setCookieHeaders = res.headers['set-cookie'];
+          if (setCookieHeaders) {
+              setCookieHeaders.forEach(cookieStr => {
+                  // A standard Set-Cookie looks like: "session_id=123abc; Path=/; Secure"
+                  // We split by ';' to get the first chunk, then split by '=' to get key/value
+                  const primaryPart = cookieStr.split(';')[0]; 
+                  const splitIndex = primaryPart.indexOf('=');
+                  if (splitIndex > -1) {
+                      const key = primaryPart.substring(0, splitIndex).trim();
+                      const val = primaryPart.substring(splitIndex + 1).trim();
+                      cookiesObj[key] = val;
+                  }
+              });
+          }
+
           resolve({
-            data: rawBody,
+            data: parsedData, // Now an Object (if it was JSON)
             status: res.statusCode,
+            statusText: res.statusMessage || "OK",
             headers: res.headers,
+            cookies: cookiesObj, // Now populated so the UI can render them!
+            size: Buffer.byteLength(rawBody),
             duration: Date.now() - startTime,
           });
         });
       });
 
       req.on("error", (err) => {
-        // console.error("[Debug] Request Error:", err.message);
         resolve({ error: err.message });
       });
 
-      // Streaming the body
       if (form) {
-        // console.log("[Debug] Piping Form-Data to request...");
         form.pipe(req);
       } else if (binaryStream) {
-        // console.log("[Debug] Piping Binary Stream to request...");
         binaryStream.pipe(req);
       } else if (config.body?.raw) {
         req.write(injectVariables(config.body.raw, envVars));
@@ -152,7 +248,6 @@ ipcMain.handle("execute-request", async (event, data) => {
     });
 
   } catch (err) {
-    // console.error("[Debug] Fatal Error:", err.message);
     return { error: err.message };
   }
 });

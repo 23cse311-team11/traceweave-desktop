@@ -26,6 +26,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
         };
     },
 
+    // --- COOKIE HANDLERS ---
+    getJarCookies: (payload) => ipcRenderer.invoke('get-jar-cookies', payload),
+    createJarCookie: (payload) => ipcRenderer.invoke('create-jar-cookie', payload),
+    deleteJarCookie: (payload) => ipcRenderer.invoke('delete-jar-cookie', payload),
+    clearJarCookies: (payload) => ipcRenderer.invoke('clear-jar-cookies', payload),
+
     getFilePath: (file) => {
         if (webUtils && webUtils.getPathForFile) {
             return webUtils.getPathForFile(file);
