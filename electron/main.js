@@ -3,6 +3,8 @@ import { fileURLToPath } from "url";
 import path from "path";
 import http from "http";
 import https from "https";
+import FormData from "form-data";
+import fs from "fs";
 import WebSocket from "ws";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -32,160 +34,143 @@ app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
-
 // =====================================================
 // ENV VARIABLE INJECTION
 // =====================================================
-
 function injectVariables(value, variables = {}) {
   if (typeof value !== "string") return value;
-
   return value.replace(/{{(.*?)}}/g, (_, key) => {
     const trimmed = key.trim();
     return variables[trimmed] ?? "";
   });
 }
 
-
 // =====================================================
 // HTTP REQUEST HANDLER
 // =====================================================
-
 ipcMain.handle("execute-request", async (event, data) => {
-  console.log("IPC RECEIVED:", JSON.stringify(data, null, 2));
-
+  // console.log("\n--- [DEBUG] IPC REQUEST RECEIVED ---");
+  
   try {
-    const config =
-      data?.payload?.overrides?.config ||
-      data?.payload?.config; 
+    const config = data?.overrides?.config || data?.config || data?.payload?.config;
+    const envVars = data?.environmentValues || {};
+    
+    if (!config) throw new Error("No config found in IPC payload");
+    
+    const { method, url, headers = {}, body } = config;
+    // console.log(`[Debug] Method: ${method}, Target URL: ${url}`);
+    // console.log(`[Debug] Incoming Body Payload: ${body ? JSON.stringify(body, null, 2) : "No body"}`);
+    
+    const resolvedUrl = new URL(injectVariables(url, envVars));
 
-    const envVars = data?.payload?.environmentValues || {};
-
-    if (!config?.url || !config?.method) {
-      return { error: "Missing method or URL in config" };
-    }
-
-    const { method, url, headers = {}, params = {}, body } = config;
-
-    // -----------------------------
-    // URL + PARAM INJECTION
-    // -----------------------------
-    const resolvedUrl = injectVariables(url, envVars);
-    const parsedUrl = new URL(resolvedUrl);
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-      const injectedValue = injectVariables(value, envVars);
-      if (injectedValue !== undefined && injectedValue !== null) {
-        parsedUrl.searchParams.set(key, injectedValue);
-      }
-    });
-
-    // -----------------------------
-    // HEADER INJECTION
-    // -----------------------------
     const injectedHeaders = {};
-    Object.entries(headers || {}).forEach(([key, value]) => {
-      injectedHeaders[key] = injectVariables(value, envVars);
+    Object.entries(headers).forEach(([k, v]) => {
+      injectedHeaders[k] = injectVariables(v, envVars);
     });
 
-    const startTime = Date.now();
-    const lib = parsedUrl.protocol === "https:" ? https : http;
+    let form = null;
+    let binaryStream = null;
 
-    return await new Promise((resolve, reject) => {
-      const req = lib.request(
-        parsedUrl,
-        { method, headers: injectedHeaders },
-        (res) => {
-          const chunks = [];
-
-          res.on("data", (chunk) => chunks.push(chunk));
-
-          res.on("end", () => {
-            const rawBody = Buffer.concat(chunks).toString();
-
-            let parsedData = rawBody;
-
-            try {
-              parsedData = JSON.parse(rawBody);
-            } catch {
-              // Not JSON, keep as string
-            }
-
-            resolve({
-              data: parsedData,  // Axios-compatible
-              status: res.statusCode,
-              statusText: res.statusMessage,
-              headers: res.headers,
-              size: Buffer.byteLength(rawBody),
-              duration: Date.now() - startTime,
-            });
-          });
+    // --- FORM DATA DEBUGGING ---
+    if (body?.type === "formdata") {
+      // console.log("[Debug] Executing Form-Data request stream buildup...");
+      form = new FormData();
+      
+      body.formdata.forEach((item) => {
+        if (item.isFile) {
+          // console.log(`[Debug] Attempting to attach file: Key="${item.key}", Path="${item.path}"`);
+          
+          if (item.path && fs.existsSync(item.path)) {
+            const stats = fs.statSync(item.path);
+            // console.log(`[Debug] Success: File found. Size: ${stats.size} bytes`);
+            form.append(item.key, fs.createReadStream(item.path));
+          } else {
+            // console.error(`[Debug] Error: File path is invalid or missing: ${item.path}`);
+          }
+        } else {
+          form.append(item.key, injectVariables(item.value, envVars));
         }
-      );
-
-      req.on("error", (err) => {
-        console.error("REQUEST ERROR:", err);
-        reject({ error: err.message });
       });
 
-      // -----------------------------
-      // BODY HANDLING WITH INJECTION
-      // -----------------------------
-
-      if (body?.type === "raw") {
-        const injectedRaw = injectVariables(body.raw || "", envVars);
-        req.write(injectedRaw);
+      // CRITICAL: If the user set a Content-Type manually, it breaks the boundary.
+      const ctKey = Object.keys(injectedHeaders).find(k => k.toLowerCase() === 'content-type');
+      if (ctKey) {
+        // console.log(`[Debug] Removing manual Content-Type: ${injectedHeaders[ctKey]} to allow boundary generation.`);
+        delete injectedHeaders[ctKey];
       }
 
-      else if (body?.type === "urlencoded") {
-        const encoded = new URLSearchParams();
-        body.urlencoded?.forEach((item) => {
-          const injectedValue = injectVariables(item.value, envVars);
-          encoded.append(item.key, injectedValue);
+      const formHeaders = form.getHeaders();
+      Object.assign(injectedHeaders, formHeaders);
+      // console.log("[Debug] Final Form Headers:", formHeaders);
+    } 
+    
+    else if (body?.type === "binary" && body?.binaryFile?.path) {
+        // console.log(`[Debug] Detected Binary Stream: ${body.binaryFile.path}`);
+        if (fs.existsSync(body.binaryFile.path)) {
+            binaryStream = fs.createReadStream(body.binaryFile.path);
+        } else {
+            // console.error(`[Debug] Error: Binary file path is invalid: ${body.binaryFile.path}`);
+        }
+    }
+
+    const lib = resolvedUrl.protocol === "https:" ? https : http;
+    const startTime = Date.now();
+
+    return await new Promise((resolve) => {
+      const req = lib.request(resolvedUrl, { method, headers: injectedHeaders }, (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          const rawBody = Buffer.concat(chunks).toString();
+          resolve({
+            data: rawBody,
+            status: res.statusCode,
+            headers: res.headers,
+            duration: Date.now() - startTime,
+          });
         });
-        req.write(encoded.toString());
-      }
+      });
 
-      else if (body?.graphql) {
-        const gqlString = injectVariables(
-          JSON.stringify(body.graphql),
-          envVars
-        );
-        req.write(gqlString);
-      }
+      req.on("error", (err) => {
+        // console.error("[Debug] Request Error:", err.message);
+        resolve({ error: err.message });
+      });
 
-      else if (body?.type === "formdata") {
-        console.warn("⚠️ Multipart form-data not implemented in Electron main yet.");
+      // Streaming the body
+      if (form) {
+        // console.log("[Debug] Piping Form-Data to request...");
+        form.pipe(req);
+      } else if (binaryStream) {
+        // console.log("[Debug] Piping Binary Stream to request...");
+        binaryStream.pipe(req);
+      } else if (config.body?.raw) {
+        req.write(injectVariables(config.body.raw, envVars));
+        req.end();
+      } else {
+        req.end();
       }
-
-      req.end();
     });
 
   } catch (err) {
-    console.error("EXECUTION FAILED:", err);
+    // console.error("[Debug] Fatal Error:", err.message);
     return { error: err.message };
   }
 });
 
-
 // =====================================================
 // WEBSOCKET EXECUTION LOGIC
 // =====================================================
-
 const activeWebSockets = new Map();
 
 ipcMain.handle("ws-connect", async (event, payload) => {
-  console.log("WS Connect Request:", payload);
   try {
     const { connectionId, url, headers = {}, params = {}, environmentValues = {} } = payload;
 
-    // 1. Clean up existing connection if it exists
     if (activeWebSockets.has(connectionId)) {
       activeWebSockets.get(connectionId).close();
       activeWebSockets.delete(connectionId);
     }
 
-    // 2. URL and Param Injection
     const resolvedUrl = injectVariables(url, environmentValues);
     const parsedUrl = new URL(resolvedUrl);
 
@@ -196,56 +181,24 @@ ipcMain.handle("ws-connect", async (event, payload) => {
       }
     });
 
-    // 3. Header Injection
     const injectedHeaders = {};
     Object.entries(headers || {}).forEach(([key, value]) => {
       injectedHeaders[key] = injectVariables(value, environmentValues);
     });
 
-    // 4. Initialize Connection
-    const ws = new WebSocket(parsedUrl.toString(), {
-      headers: injectedHeaders,
-    });
-
+    const ws = new WebSocket(parsedUrl.toString(), { headers: injectedHeaders });
     activeWebSockets.set(connectionId, ws);
 
-    // 5. Wire up Event Listeners to push data to the Renderer
-    ws.on("open", () => {
-      event.sender.send("ws-event", { connectionId, type: "open" });
-    });
-
-    ws.on("message", (data) => {
-      // Data is a Buffer, convert to string for the frontend
-      event.sender.send("ws-event", {
-        connectionId,
-        type: "message",
-        data: data.toString(),
-        timestamp: Date.now()
-      });
-    });
-
-    ws.on("error", (err) => {
-      console.error(`WS Error [${connectionId}]:`, err.message);
-      event.sender.send("ws-event", {
-        connectionId,
-        type: "error",
-        error: err.message,
-      });
-    });
-
+    ws.on("open", () => event.sender.send("ws-event", { connectionId, type: "open" }));
+    ws.on("message", (data) => event.sender.send("ws-event", { connectionId, type: "message", data: data.toString(), timestamp: Date.now() }));
+    ws.on("error", (err) => event.sender.send("ws-event", { connectionId, type: "error", error: err.message }));
     ws.on("close", (code, reason) => {
-      event.sender.send("ws-event", {
-        connectionId,
-        type: "close",
-        code,
-        reason: reason.toString(),
-      });
+      event.sender.send("ws-event", { connectionId, type: "close", code, reason: reason.toString() });
       activeWebSockets.delete(connectionId);
     });
 
     return { success: true };
   } catch (err) {
-    console.error("WS CONNECTION FAILED:", err);
     return { success: false, error: err.message };
   }
 });

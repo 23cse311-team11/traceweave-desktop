@@ -1,6 +1,6 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
-console.log("✅ PRELOAD LOADED");
+// console.log("✅ PRELOAD LOADED");
 
 contextBridge.exposeInMainWorld('electronAPI', {
     executeRequest: (payload) =>
@@ -15,7 +15,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     wsDisconnect: (payload) =>
         ipcRenderer.invoke('ws-disconnect', payload),
 
-    // NEW: Listen for push events from the Main process
     onWsEvent: (callback) => {
         // Strip the event object and just pass the data to the frontend
         const listener = (_event, data) => callback(data);
@@ -25,5 +24,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
         return () => {
             ipcRenderer.removeListener('ws-event', listener);
         };
+    },
+
+    getFilePath: (file) => {
+        if (webUtils && webUtils.getPathForFile) {
+            return webUtils.getPathForFile(file);
+        }
+        return file.path; // Fallback for older Electron versions
     }
 });
