@@ -24,7 +24,7 @@ export async function executeHttpRequest(data) {
   const existingCookies = injectedHeaders['Cookie'] || '';
   const jarCookies = await CookieService.getCookiesForUrl(resolvedUrl.toString());
   if (jarCookies) {
-    injectedHeaders['Cookie'] = existingCookies ? `${existingCookies}; ${jarCookies}` : jarCookies;
+    injectedHeaders['Cookie'] = existingCookies ? `${jarCookies}; ${existingCookies}` : jarCookies;
   }
 
   // Body Handling

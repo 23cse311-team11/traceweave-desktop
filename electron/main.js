@@ -4,6 +4,8 @@ import path from "path";
 import { CookieService } from "./services/cookieService.js";
 import { executeHttpRequest } from "./services/requestService.js";
 import { WsService } from "./services/wsService.js";
+import dotenv from "dotenv";
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,7 +21,17 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadURL("http://localhost:3000");
+  const isDev = process.env.NODE_ENV === "development";
+
+  mainWindow.loadURL(
+    isDev
+      ? "http://localhost:3000"
+      : "https://www.traceweavesupply.tech"
+  );
+}
+
+if (process.platform === "linux") {
+  app.commandLine.appendSwitch("no-sandbox")
 }
 
 // Initialize persistence and window

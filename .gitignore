@@ -25,3 +25,5 @@ Thumbs.db
 release-builds/
 dist/
 *.compiled.*
+
+.env
